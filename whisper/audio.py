@@ -24,7 +24,7 @@ TOKENS_PER_SECOND = exact_div(SAMPLE_RATE, N_SAMPLES_PER_TOKEN)  # 20ms per audi
 
 def load_audio(file: str, sr: int = SAMPLE_RATE):
     """
-    Open an audio file and read as mono waveform, resampling as necessary
+    Open an audio file and read as the channels in as arrays of waveforms, resampling as necessary
 
     Parameters
     ----------
@@ -47,8 +47,8 @@ def load_audio(file: str, sr: int = SAMPLE_RATE):
         "-nostdin",
         "-threads", "0",
         "-i", file,
-        "-f", "s16le",
-        "-ac", "1",
+        "-f", "wav", # we need the wav header, as we want to know how many channels we're dealing with
+        #"-ac", "1", # don't flatten to a single channel
         "-acodec", "pcm_s16le",
         "-ar", str(sr),
         "-"
@@ -58,7 +58,12 @@ def load_audio(file: str, sr: int = SAMPLE_RATE):
         out = run(cmd, capture_output=True, check=True).stdout
     except CalledProcessError as e:
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
-
+    
+    # grab the wav header, in order to ascertain the number of channels
+    numChannels = int.from_bytes(out[22:24], byteorder='little')
+    
+    raise RuntimeError(f"numChannelse: {numChannelse}") from e
+    
     return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
 
 
