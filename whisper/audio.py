@@ -24,7 +24,7 @@ TOKENS_PER_SECOND = exact_div(SAMPLE_RATE, N_SAMPLES_PER_TOKEN)  # 20ms per audi
 
 def load_audio(file: str, sr: int = SAMPLE_RATE):
     """
-    Open an audio file and read as an array of waveforms (one for each channel), resampling as necessary
+    Open an audio file and read as mono waveform, resampling as necessary
 
     Parameters
     ----------
