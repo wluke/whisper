@@ -62,7 +62,7 @@ def load_audio(file: str, sr: int = SAMPLE_RATE):
     # grab the wav header, in order to ascertain the number of channels
     numChannels = int.from_bytes(out[22:24], byteorder='little')
     
-    raise RuntimeError(f"numChannelse: {numChannelse}") from e
+    raise RuntimeError(f"numChannels: {numChannels}") from e
     
     return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
 
