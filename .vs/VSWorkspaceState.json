@@ -1,6 +1,11 @@
 {
   "ExpandedNodes": [
-    ""
+    "",
+    "\\Local settings (.vs)\\whisper",
+    "\\Local settings (.vs)\\whisper\\config",
+    "\\Local settings (.vs)\\whisper\\FileContentIndex",
+    "\\Local settings (.vs)\\whisper\\v17"
   ],
+  "SelectedNode": "\\whisper",
   "PreviewInSolutionExplorer": false
 }
