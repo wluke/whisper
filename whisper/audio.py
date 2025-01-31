@@ -1,6 +1,7 @@
 import os
 from functools import lru_cache
 from subprocess import CalledProcessError, run
+import subprocess
 from typing import Optional, Union
 
 import numpy as np
@@ -51,20 +52,61 @@ def load_audio(file: str, sr: int = SAMPLE_RATE):
         #"-ac", "1", # don't flatten to a single channel
         "-acodec", "pcm_s16le",
         "-ar", str(sr),
+       # "-flags", "+bitexact",
         "-"
     ]
     # fmt: on
     try:
-        out = run(cmd, capture_output=True, check=True).stdout
+        ffmpeg_cmd = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=None, shell=False)
+
+        #ffmpeg_cmd = open('left.wav', 'rb')
+        #out, err = cmd_result.communicate()
+        out = b''
+        while(True):
+            os.set_blocking(ffmpeg_cmd.stdout.fileno(), False)
+            output = ffmpeg_cmd.stdout.read()
+            if output != None and len(output) > 0:
+                out += output
+            else:
+                error_msg = ffmpeg_cmd.poll()
+                if error_msg is not None:
+                    break
+        #out = ffmpeg_cmd.stdout
+
+        #cmd_res = run(cmd, capture_output=True, check = True, shell=False)
+        #out = cmd_res.stdout
+
     except CalledProcessError as e:
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
     
-    # grab the wav header, in order to ascertain the number of channels
+    #grab the wav header, in order to ascertain the number of channels
+    
+    #fh = open('converted.wav', 'rb')
+    #out, err = cmd_result.communicate()
+    #out = fh.read()
+    
     numChannels = int.from_bytes(out[22:24], byteorder='little')
     
-    #raise RuntimeError(f"numChannels: {numChannels}")
+    subchunk2size = int.from_bytes(out[40:44], byteorder='little')
     
-    return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
+
+    # find the "data" chunk
+    datachunkstart = 44
+    for i in range(44,120):
+        test = out[i:i+4]
+        if test == b'data':
+            datachunkstart = i + 4
+            break
+
+    rawData = np.frombuffer(out[datachunkstart:], np.int16)
+    
+    output = []
+    for i in range(numChannels-1, -1, -1):
+    #i=0
+        output.append(rawData[i::numChannels].flatten().astype(np.float32) / 32768.0)
+    #raise RuntimeError(f"numChannels: {numChannels}")
+
+    return output #np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
 
 
 def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
@@ -132,7 +174,7 @@ def log_mel_spectrogram(
     padding: int
         Number of zero samples to pad to the right
 
-    device: Optional[Union[str, torch.device]]
+    -- REMOVED device: Optional[Union[str, torch.device]]
         If given, the audio tensor is moved to this device before STFT
 
     Returns
@@ -140,23 +182,41 @@ def log_mel_spectrogram(
     torch.Tensor, shape = (n_mels, n_frames)
         A Tensor that contains the Mel spectrogram
     """
+    torchChannels = []
     if not torch.is_tensor(audio):
         if isinstance(audio, str):
             audio = load_audio(audio)
-        audio = torch.from_numpy(audio)
+        if isinstance(audio, list):
+            numChannels = len(audio)
+            for i in range(0,numChannels):
+                torchChannels.append(torch.from_numpy(audio[i]))
+        else:
+            torchChannels.append(torch.from_numpy(audio[0]))
+    else:
+        torchChannels.append(np.array([audio]))
 
-    if device is not None:
-        audio = audio.to(device)
-    if padding > 0:
-        audio = F.pad(audio, (0, padding))
-    window = torch.hann_window(N_FFT).to(audio.device)
-    stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
-    magnitudes = stft[..., :-1].abs() ** 2
+    numChannels = len(torchChannels)
 
-    filters = mel_filters(audio.device, n_mels)
-    mel_spec = filters @ magnitudes
+    log_spec = []
+    
+    for i in range(0,numChannels):
+        #if device is not None:
+        #    audio = audio.to(device)
 
-    log_spec = torch.clamp(mel_spec, min=1e-10).log10()
-    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
-    log_spec = (log_spec + 4.0) / 4.0
+        if padding > 0:
+            torchChannels[i] = F.pad(torchChannels[i], (0, padding))
+
+        window = torch.hann_window(N_FFT).to(torchChannels[i].device)
+        stft = torch.stft(torchChannels[i], N_FFT, HOP_LENGTH, window=window, return_complex=True)
+        magnitudes = stft[..., :-1].abs() ** 2
+
+        filters = mel_filters(torchChannels[i].device, n_mels)
+        mel_spec = filters @ magnitudes
+
+        current_log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+        current_log_spec = torch.maximum(current_log_spec, current_log_spec.max() - 8.0)
+        current_log_spec = (current_log_spec + 4.0) / 4.0
+
+        log_spec.append(current_log_spec)
+
     return log_spec

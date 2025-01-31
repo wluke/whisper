@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from torch._prims_common import are_strides_like_channels_last
 import tqdm
 
 from .audio import (
@@ -137,7 +138,14 @@ def transcribe(
 
     # Pad 30-seconds of silence to the input audio, for slicing
     mel = log_mel_spectrogram(audio, model.dims.n_mels, padding=N_SAMPLES)
-    content_frames = mel.shape[-1] - N_FRAMES
+
+    numberChannels = len(mel)
+
+    #for curChan in range(0, numberChannels):
+
+    curChan = 0
+
+    content_frames = mel[curChan].shape[-1] - N_FRAMES
     content_duration = float(content_frames * HOP_LENGTH / SAMPLE_RATE)
 
     if decode_options.get("language", None) is None:
@@ -148,7 +156,7 @@ def transcribe(
                 print(
                     "Detecting language using up to the first 30 seconds. Use `--language` to specify the language"
                 )
-            mel_segment = pad_or_trim(mel, N_FRAMES).to(model.device).to(dtype)
+            mel_segment = pad_or_trim(mel[curChan], N_FRAMES).to(model.device).to(dtype)
             _, probs = model.detect_language(mel_segment)
             decode_options["language"] = max(probs, key=probs.get)
             if verbose is not None:
@@ -223,8 +231,9 @@ def transcribe(
 
         return decode_result
 
-    clip_idx = 0
-    seek = seek_clips[clip_idx][0]
+    for curChan in range(0, numberChannels):
+        mel[curChan].clip_idx = 0
+        mel[curChan].seek = seek_clips[mel[curChan].clip_idx][0]
     input_stride = exact_div(
         N_FRAMES, model.dims.n_audio_ctx
     )  # mel frames per output token: 2
@@ -234,6 +243,7 @@ def transcribe(
     all_tokens = []
     all_segments = []
     prompt_reset_since = 0
+    curChan = 0
 
     remaining_prompt_length = model.dims.n_text_ctx // 2 - 1
     if initial_prompt is not None:
@@ -244,12 +254,12 @@ def transcribe(
         initial_prompt_tokens = []
 
     def new_segment(
-        *, start: float, end: float, tokens: torch.Tensor, result: DecodingResult
+        *, start: float, end: float, tokens: torch.Tensor, result: DecodingResult, speakerChannel: int
     ):
         tokens = tokens.tolist()
         text_tokens = [token for token in tokens if token < tokenizer.eot]
         return {
-            "seek": seek,
+            "seek": mel[curChan].seek,
             "start": start,
             "end": end,
             "text": tokenizer.decode(text_tokens),
@@ -258,6 +268,7 @@ def transcribe(
             "avg_logprob": result.avg_logprob,
             "compression_ratio": result.compression_ratio,
             "no_speech_prob": result.no_speech_prob,
+            "speakerChannel": speakerChannel
         }
 
     # show the progress bar when verbose is False (if True, transcribed text will be printed)
@@ -269,19 +280,23 @@ def transcribe(
         # A later commit should turn this into a simpler nested loop.
         # for seek_clip_start, seek_clip_end in seek_clips:
         #     while seek < seek_clip_end
-        while clip_idx < len(seek_clips):
-            seek_clip_start, seek_clip_end = seek_clips[clip_idx]
-            if seek < seek_clip_start:
-                seek = seek_clip_start
-            if seek >= seek_clip_end:
-                clip_idx += 1
-                if clip_idx < len(seek_clips):
-                    seek = seek_clips[clip_idx][0]
+        while mel[curChan]. clip_idx < len(seek_clips):
+
+            ## WL okay, here I *think* is where we want to alternative forward between all channels in the loop
+
+            seek_clip_start, seek_clip_end = seek_clips[mel[curChan].clip_idx]
+            if mel[curChan].seek < seek_clip_start:
+                mel[curChan].seek = seek_clip_start
+            if mel[curChan].seek >= seek_clip_end:
+                mel[curChan].clip_idx += 1
+                if mel[curChan].clip_idx < len(seek_clips):
+                    mel[curChan].seek = seek_clips[clip_idx][0]
+                ## Here, do the next channel, and restore the clip_index, seek_clips and seek from it from it
                 continue
-            time_offset = float(seek * HOP_LENGTH / SAMPLE_RATE)
-            window_end_time = float((seek + N_FRAMES) * HOP_LENGTH / SAMPLE_RATE)
-            segment_size = min(N_FRAMES, content_frames - seek, seek_clip_end - seek)
-            mel_segment = mel[:, seek : seek + segment_size]
+            time_offset = float(mel[curChan].seek * HOP_LENGTH / SAMPLE_RATE)
+            window_end_time = float((mel[curChan].seek + N_FRAMES) * HOP_LENGTH / SAMPLE_RATE)
+            segment_size = min(N_FRAMES, content_frames - mel[curChan].seek, seek_clip_end - mel[curChan].seek)
+            mel_segment = mel[curChan][:, mel[curChan].seek : mel[curChan].seek + segment_size]
             segment_duration = segment_size * HOP_LENGTH / SAMPLE_RATE
             mel_segment = pad_or_trim(mel_segment, N_FRAMES).to(model.device).to(dtype)
 
@@ -306,11 +321,11 @@ def transcribe(
                     should_skip = False
 
                 if should_skip:
-                    seek += segment_size  # fast-forward to the next segment boundary
+                    mel[curChan].seek += segment_size  # fast-forward to the next segment boundary
                     continue
 
-            previous_seek = seek
-            current_segments = []
+            mel[curChan].previous_seek = mel[curChan].seek
+            mel[curChan].current_segments = []
 
             # anomalous words are very long/short/improbable
             def word_anomaly_score(word: dict) -> float:
@@ -356,25 +371,26 @@ def transcribe(
                     end_timestamp_pos = (
                         sliced_tokens[-1].item() - tokenizer.timestamp_begin
                     )
-                    current_segments.append(
+                    mel[curChan].current_segments.append(
                         new_segment(
                             start=time_offset + start_timestamp_pos * time_precision,
                             end=time_offset + end_timestamp_pos * time_precision,
                             tokens=sliced_tokens,
                             result=result,
+                            speakerChannel=curChan
                         )
                     )
                     last_slice = current_slice
 
                 if single_timestamp_ending:
                     # single timestamp at the end means no speech after the last timestamp.
-                    seek += segment_size
+                    mel[curChan].seek += segment_size
                 else:
                     # otherwise, ignore the unfinished segment and seek to the last timestamp
                     last_timestamp_pos = (
                         tokens[last_slice - 1].item() - tokenizer.timestamp_begin
                     )
-                    seek += last_timestamp_pos * input_stride
+                    mel[curChan].seek += last_timestamp_pos * input_stride
             else:
                 duration = segment_duration
                 timestamps = tokens[timestamp_tokens.nonzero().flatten()]
@@ -388,19 +404,20 @@ def transcribe(
                     )
                     duration = last_timestamp_pos * time_precision
 
-                current_segments.append(
+                mel[curChan].current_segments.append(
                     new_segment(
                         start=time_offset,
                         end=time_offset + duration,
                         tokens=tokens,
                         result=result,
+                        speakerChannel=curChan
                     )
                 )
-                seek += segment_size
+                mel[curChan].seek += segment_size
 
             if word_timestamps:
                 add_word_timestamps(
-                    segments=current_segments,
+                    segments=mel[curChan].current_segments,
                     model=model,
                     tokenizer=tokenizer,
                     mel=mel_segment,
@@ -411,40 +428,40 @@ def transcribe(
                 )
 
                 if not single_timestamp_ending:
-                    last_word_end = get_end(current_segments)
+                    last_word_end = get_end(mel[curChan].current_segments)
                     if last_word_end is not None and last_word_end > time_offset:
-                        seek = round(last_word_end * FRAMES_PER_SECOND)
+                        mel[curChan].seek = round(last_word_end * FRAMES_PER_SECOND)
 
                 # skip silence before possible hallucinations
                 if hallucination_silence_threshold is not None:
                     threshold = hallucination_silence_threshold
                     if not single_timestamp_ending:
-                        last_word_end = get_end(current_segments)
+                        last_word_end = get_end(mel[curChan].current_segments)
                         if last_word_end is not None and last_word_end > time_offset:
                             remaining_duration = window_end_time - last_word_end
                             if remaining_duration > threshold:
-                                seek = round(last_word_end * FRAMES_PER_SECOND)
+                                mel[curChan].seek = round(last_word_end * FRAMES_PER_SECOND)
                             else:
-                                seek = previous_seek + segment_size
+                                mel[curChan].seek = mel[curChan].previous_seek + segment_size
 
                     # if first segment might be a hallucination, skip leading silence
-                    first_segment = next_words_segment(current_segments)
+                    first_segment = next_words_segment(mel[curChan].current_segments)
                     if first_segment is not None and is_segment_anomaly(first_segment):
                         gap = first_segment["start"] - time_offset
                         if gap > threshold:
-                            seek = previous_seek + round(gap * FRAMES_PER_SECOND)
+                            mel[curChan].seek = mel[curChan].previous_seek + round(gap * FRAMES_PER_SECOND)
                             continue
 
                     # skip silence before any possible hallucination that is surrounded
                     # by silence or more hallucinations
                     hal_last_end = last_speech_timestamp
-                    for si in range(len(current_segments)):
-                        segment = current_segments[si]
+                    for si in range(len(mel[curChan].current_segments)):
+                        segment = mel[curChan].current_segments[si]
                         if not segment["words"]:
                             continue
                         if is_segment_anomaly(segment):
                             next_segment = next_words_segment(
-                                current_segments[si + 1 :]
+                                mel[curChan].current_segments[si + 1 :]
                             )
                             if next_segment is not None:
                                 hal_next_start = next_segment["words"][0]["start"]
@@ -461,28 +478,24 @@ def transcribe(
                                 or window_end_time - segment["end"] < 2.0
                             )
                             if silence_before and silence_after:
-                                seek = round(
+                                mel[curChan].seek = round(
                                     max(time_offset + 1, segment["start"])
                                     * FRAMES_PER_SECOND
                                 )
                                 if content_duration - segment["end"] < threshold:
-                                    seek = content_frames
-                                current_segments[si:] = []
+                                    mel[curChan].seek = content_frames
+                                mel[curChan].current_segments[si:] = []
                                 break
                         hal_last_end = segment["end"]
 
-                last_word_end = get_end(current_segments)
+                last_word_end = get_end(mel[curChan].current_segments)
                 if last_word_end is not None:
                     last_speech_timestamp = last_word_end
 
-            if verbose:
-                for segment in current_segments:
-                    start, end, text = segment["start"], segment["end"], segment["text"]
-                    line = f"[{format_timestamp(start)} --> {format_timestamp(end)}] {text}"
-                    print(make_safe(line))
+           
 
             # if a segment is instantaneous or does not contain text, clear it
-            for i, segment in enumerate(current_segments):
+            for i, segment in enumerate(mel[curChan].current_segments):
                 if segment["start"] == segment["end"] or segment["text"].strip() == "":
                     segment["text"] = ""
                     segment["tokens"] = []
@@ -492,12 +505,12 @@ def transcribe(
                 [
                     {"id": i, **segment}
                     for i, segment in enumerate(
-                        current_segments, start=len(all_segments)
+                        mel[curChan].current_segments, start=len(all_segments)
                     )
                 ]
             )
             all_tokens.extend(
-                [token for segment in current_segments for token in segment["tokens"]]
+                [token for segment in mel[curChan].current_segments for token in segment["tokens"]]
             )
 
             if not condition_on_previous_text or result.temperature > 0.5:
@@ -505,7 +518,22 @@ def transcribe(
                 prompt_reset_since = len(all_tokens)
 
             # update progress bar
-            pbar.update(min(content_frames, seek) - previous_seek)
+            pbar.update(min(content_frames, mel[curChan].seek) - mel[curChan].previous_seek)
+
+            # proceed to next channel
+            curChan += 1
+            if curChan >= numberChannels:
+                curChan = 0
+                if verbose:
+                    latestSegments = []
+                    for i in range(numberChannels):
+                        latestSegments += mel[i].current_segments
+
+                    for segment in sorted(latestSegments, key=lambda x: x["end"], reverse=False):
+                        start, end, text, channel = segment["start"], segment["end"], segment["text"], "" if numberChannels == 1 else " " + ("LEFT" if segment["speakerChannel"] == 0 else "RIGHT")
+                        line = f"[{format_timestamp(start)} --> {format_timestamp(end)} {channel}] {text}"
+                        print(make_safe(line))
+
 
     return dict(
         text=tokenizer.decode(all_tokens[len(initial_prompt_tokens) :]),
